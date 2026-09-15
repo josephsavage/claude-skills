@@ -1,384 +1,437 @@
 ---
 name: "pr-review-expert"
-description: "Use when the user asks to review pull requests, analyze code changes, check for security issues in PRs, or assess code quality of diffs."
+description: "Orchestrated pull request review. Maps the PR's shape, runs /code-review high and /adversarial-reviewer as subagents, checks the diff against the project's own standards, validates every finding against the code, discards weak findings, and reports a PR strength assessment with a fix / pending / ignore recommendation per finding. Use when the user asks to review a pull request, a branch, or a diff."
+argument-hint: "[PR number | branch name | empty for the current branch]"
 ---
 
 # PR Review Expert
 
-**Tier:** POWERFUL
-**Category:** Engineering
-**Domain:** Code Review / Quality Assurance
+The session that loads this skill is the **orchestrator**. The orchestrator maps
+the PR, runs two reviewer subagents, runs its own project-standards pass, and
+validates every candidate finding. Only the orchestrator writes the report.
 
----
+Target: `$ARGUMENTS`
 
-## Overview
+## Rules for every run
 
-Structured, systematic code review for GitHub PRs and GitLab MRs. Goes beyond style nits — this skill
-performs blast radius analysis, security scanning, breaking change detection, and test coverage delta
-calculation. Produces a reviewer-ready report with a 30+ item checklist and prioritized findings.
+1. **Evidence or discard.** A finding reaches the report only with a `file:line`
+   at the PR head, lines the orchestrator read itself, and a concrete failure
+   scenario.
+2. **Docs before code.** Read the project instructions and the reference docs for
+   touched modules before reading changed code.
+3. **Reviewer output is candidate input.** No subagent verdict is final. Phase 5
+   decides.
+4. **Severity comes from impact.** Agreement between reviewers raises confidence.
+   Agreement does not raise severity.
+5. **Read-only.** Never check out the PR in the user's working tree. Never create
+   a local branch. Never push, approve, comment, or edit project files.
+6. **Never pass `--comment` or `--fix`** to `/code-review`.
+7. **No filler.** State a strength only when evidence supports it. Never add a
+   finding to fill a section.
+8. **Stable verdicts.** After the report, follow "Answering follow-up questions".
 
----
+## Candidate finding format
 
-## Core Capabilities
+Every reviewer, and the standards pass, emits candidates in this format:
 
-- **Blast radius analysis** — trace which files, services, and downstream consumers could break
-- **Security scan** — SQL injection, XSS, auth bypass, secret exposure, dependency vulns
-- **Test coverage delta** — new code vs new tests ratio
-- **Breaking change detection** — API contracts, DB schema migrations, config keys
-- **Ticket linking** — verify Jira/Linear ticket exists and matches scope
-- **Performance impact** — N+1 queries, bundle size regression, memory allocations
-
----
-
-## When to Use
-
-- Before merging any PR/MR that touches shared libraries, APIs, or DB schema
-- When a PR is large (>200 lines changed) and needs structured review
-- Onboarding new contributors whose PRs need thorough feedback
-- Security-sensitive code paths (auth, payments, PII handling)
-- After an incident — review similar PRs proactively
-
----
-
-## Fetching the Diff
-
-### GitHub (gh CLI)
-```bash
-# View diff in terminal
-gh pr diff <PR_NUMBER>
-
-# Get PR metadata (title, body, labels, linked issues)
-gh pr view <PR_NUMBER> --json title,body,labels,assignees,milestone
-
-# List files changed
-gh pr diff <PR_NUMBER> --name-only
-
-# Check CI status
-gh pr checks <PR_NUMBER>
-
-# Download diff to file for analysis
-gh pr diff <PR_NUMBER> > /tmp/pr-<PR_NUMBER>.diff
+```
+ID: <CR-n | ADV-n | STD-n>
+Severity: critical | warning | note
+Location: path/to/file.py:123
+Claim: <one sentence>
+Failure scenario: <inputs or state> -> <wrong result>
+Evidence: <what the reviewer read or ran>
+Source verdict: CONFIRMED | PLAUSIBLE | none
+Raised by: <reviewer or persona>
+Quota finding: yes | no
 ```
 
-### GitLab (glab CLI)
-```bash
-# View MR diff
-glab mr diff <MR_IID>
+## Phase 0 — Resolve the target
 
-# MR details as JSON
-glab mr view <MR_IID> --output json
-
-# List changed files
-glab mr diff <MR_IID> --name-only
-
-# Download diff
-glab mr diff <MR_IID> > /tmp/mr-<MR_IID>.diff
-```
-
----
-
-## Workflow
-
-### Step 1 — Fetch Context
+For a PR number `<N>`:
 
 ```bash
-PR=123
-gh pr view $PR --json title,body,labels,milestone,assignees | jq .
-gh pr diff $PR --name-only
-gh pr diff $PR > /tmp/pr-$PR.diff
+gh pr view <N> --json number,title,body,url,baseRefName,headRefName,headRefOid,additions,deletions,changedFiles,commits,labels
+git fetch origin <baseRefName>
+git fetch origin pull/<N>/head
+git rev-parse FETCH_HEAD        # must equal headRefOid; stop and report a mismatch
+git worktree add --detach <scratchpad>/pr-<N> <headRefOid>
+git -C <scratchpad>/pr-<N> diff origin/<baseRefName>...<headRefOid> > <scratchpad>/pr-<N>.diff
 ```
 
-### Step 2 — Blast Radius Analysis
+For a branch name, or no argument, run `gh pr view [<branch>] --json ...` to find
+the open PR. If no PR exists, use the PR base branch that the project
+instructions name. Otherwise use the repository default branch.
 
-For each changed file, identify:
+`git worktree add --detach` creates no branch and no upstream. If `headRefOid`
+equals `git rev-parse HEAD` in the user's checkout, and the checkout is clean,
+review the checkout directly and create no worktree.
 
-1. **Direct dependents** — who imports this file?
+For a GitLab merge request, use the `glab mr view` and `glab mr diff`
+equivalents.
+
+Record these values and use them in every later phase:
+
+| Value | Meaning |
+|---|---|
+| `TARGET` | PR number, or branch name |
+| `BASE_REF` | `origin/<baseRefName>` |
+| `HEAD_SHA` | `headRefOid` |
+| `DIFF_RANGE` | `BASE_REF...HEAD_SHA` (diff from the merge base) |
+| `REVIEW_ROOT` | absolute path of the worktree, or of the user's checkout |
+| `DIFF_FILE` | absolute path of the saved diff |
+
+## Phase 1 — Map the shape
+
+Build the Shape block from the PR metadata, `git diff --name-status DIFF_RANGE`,
+and `DIFF_FILE`.
+
+1. **Purpose.** State the intent of the PR in one sentence. List every spec,
+   feature brief, or decision record that the PR body or the diff references.
+2. **Size.** Count files, added lines, removed lines, and commits. Record the
+   count of changed source lines separately from tests, docs, and migrations.
+3. **Layers.** Classify each changed file: API router, worker, domain, model or
+   schema, migration, integration, test, doc, config or infrastructure, other.
+   Use the project's layout doc to map directories to layers.
+4. **Blast radius.** For each changed non-test module, find its importers with
+   Grep. Name the production entry points that reach it. Rate the radius:
+   - CRITICAL: shared model, auth, payments, API contract, DB schema.
+   - HIGH: module with more than three importers, shared config, env vars.
+   - MEDIUM: internal change inside one module.
+   - LOW: tests, docs, isolated UI component.
+5. **Contract surfaces.** List changes to API routes, response schemas, DB schema,
+   migrations, queue payloads, WebSocket or event frames, env vars, config keys.
+6. **Orchestration flag.** Set the flag when the diff touches workers, queues,
+   scheduled jobs, entry points, route wiring, loop ordering, or feature gates,
+   or when it replaces a flow. The flag activates the project's required review
+   format, if the project defines one.
+7. **Tests and docs touched.** Count changed test files and changed doc files
+   against changed source files.
+8. **Scan leads.** Search `DIFF_FILE` with the pattern sets in
+   [references/scan_patterns.md](references/scan_patterns.md) for each language
+   in the diff. A match is a lead for Phase 3. A match is never a finding.
+9. **CI status.** Record `gh pr checks <N>` as information. Raise no finding for
+   missing or failing CI when project instructions or memory mark CI as
+   non-gating.
+
+## Phase 2 — Launch the adversarial reviewer (background)
+
+Launch this agent immediately after Phase 1. Use the Agent tool with
+`subagent_type: general-purpose` and `run_in_background: true`. The
+adversarial-reviewer skill needs no subagents, so the background tool set is
+sufficient.
+
+Prompt:
+
+```
+You are a reviewer subagent. You review code. You do not change code.
+
+Target: <TARGET>. Head: <HEAD_SHA>. Base: <BASE_REF>.
+The PR head is checked out at <REVIEW_ROOT>. Your working directory holds a
+different revision. Read every file from <REVIEW_ROOT>. Run git as
+`git -C <REVIEW_ROOT> ...`.
+
+1. Read <REVIEW_ROOT>/CLAUDE.md, if it exists, for project conventions.
+2. Invoke the adversarial-reviewer skill with the Skill tool. Args: --diff <DIFF_RANGE>
+3. Run all three personas as that skill instructs.
+4. Do not edit files, commit, push, or post comments.
+
+Your final message is the only output the orchestrator receives. List every
+finding in the candidate format below, with ID prefix ADV-. Set
+"Quota finding: yes" on any finding you raised to meet a persona's minimum of
+one finding, rather than because you found a defect. End with the skill's
+verdict.
+
+<paste the candidate finding format>
+```
+
+## Phase 3 — Project standards pass (orchestrator)
+
+Run this pass while the adversarial reviewer works. Finish it before you read any
+reviewer output, so reviewer findings do not bias it.
+
+### 3a. Load the standards
+
+Read these sources in order:
+
+1. `CLAUDE.md` at the repository root, and any `CLAUDE.md` in a directory the diff
+   touches.
+2. `AGENTS.md`, and the documentation index that these files name.
+3. Every per-module reference doc for a module the diff touches, end to end.
+4. The docs those files link for architecture, change discipline, testing,
+   documentation, schema changes, and code review format.
+5. The memory files whose index description bears on review findings.
+
+Write the Standards table: one row per rule, with its source `file:line`. Cover
+every category below. For a category the project does not define, write
+"no project rule found" and apply general practice.
+
+| ID | Category | Extract |
+|---|---|---|
+| S1 | Layer boundaries | Which layer owns transactions, commits, HTTP errors, and business logic. Enforcement artifacts: ratchet baselines, sanctioned-exception lists, and who approves an exception. |
+| S2 | Function reuse | Rules against parallel implementations, the generalize-first rule, rename rules. |
+| S3 | Tests | When tests must ship, required test infrastructure, production-entry regression tests, rules against removing or weakening tests. |
+| S4 | Documentation | When docs must ship, which doc tree holds which content, spec and brief updates. |
+| S5 | Change safety | Deprecation policy, preservation maps, TODO policy, required review format and headings. |
+| S6 | Data and schema | Migration workflow, idempotency, append-only tables, DDL location, DB constraints. |
+
+### 3b. Check the diff against the standards
+
+Read every changed source file in full at `REVIEW_ROOT`. Read the callers of
+changed functions.
+
+- **S1 boundaries.** For each changed file in a boundary-governed layer, compare
+  it with `git show BASE_REF:<path>`. Record each net-new commit, HTTP error, or
+  business rule in the wrong layer. Record each change to an enforcement baseline
+  or sanctioned list, and whether the PR cites approval.
+- **S2 reuse.** For each new function, search for an existing function that
+  queries the same tables or performs the same operation. Grep for the key
+  table, column, and verb names. Record a parallel implementation, and name the
+  existing function. Record each renamed function or changed import alias.
+- **S3 tests.** Map each behavior change to the test that exercises it. Record
+  each behavior change with no test. Record each deleted, skipped, or narrowed
+  test, and whether the PR cites approval. When the orchestration flag is set,
+  require a test against the production entry point.
+- **S4 docs.** Map each behavior change to the reference doc for that surface.
+  Record each doc that now contradicts the code. Record each new doc in the wrong
+  tree.
+- **S5 change safety.** List every call that the diff removes from a router,
+  worker, scheduled job, queue consumer, or top-level orchestrator. For each
+  call, find the new production path, or record "none found". Record each new
+  TODO or FIXME line that the project policy forbids.
+- **S6 data and schema.** Check migrations against the project's migration
+  workflow. Check new worker writes for retry idempotency. Check DB constraints
+  in migrations, not only in ORM models.
+- **Scan leads.** Resolve each Phase 1 lead to a candidate or to "no issue".
+
+Write each result in the candidate format with ID prefix `STD-`.
+
+## Phase 4 — Run /code-review high (foreground)
+
+Use the Agent tool with `subagent_type: general-purpose` and
+`run_in_background: false`. A foreground subagent keeps the Agent tool, so
+`/code-review` can run its own subagents.
+
+Prompt:
+
+```
+You are a reviewer subagent. You review code. You do not change code.
+
+Target: <TARGET>. Head: <HEAD_SHA>. Base: <BASE_REF>.
+The PR head is checked out at <REVIEW_ROOT>. Your working directory holds a
+different revision. When you read a file, read it from <REVIEW_ROOT>.
+
+1. Invoke the code-review skill with the Skill tool. Args: high <TARGET>
+2. Do not pass --comment or --fix. Do not edit files, commit, push, or post
+   comments.
+3. If the Skill tool cannot load code-review, stop. Report
+   "code-review unavailable" with the error text.
+
+Your final message is the only output the orchestrator receives. The findings
+display that /code-review renders does not reach the orchestrator. After
+/code-review finishes, restate every finding it reported in the candidate
+format below, with ID prefix CR-. Keep the CONFIRMED or PLAUSIBLE verdict that
+/code-review assigned.
+
+<paste the candidate finding format>
+```
+
+**Fallback.** If the subagent reports "code-review unavailable", invoke
+`code-review` in the orchestrator with the Skill tool and args `high <TARGET>`.
+Record the run mode in the report.
+
+## Phase 5 — Validate every candidate
+
+Wait for the completion notification of the adversarial reviewer. Do not poll.
+If a reviewer failed, record it as "not run" with its error, and continue.
+
+Pool all `CR-`, `ADV-`, and `STD-` candidates. Apply these steps to each one:
+
+1. **Merge duplicates.** Merge candidates with one root cause into one finding.
+   Keep every source ID.
+2. **Check the citation.** Read the cited lines at `REVIEW_ROOT`, and quote them
+   in the finding. Discard with D1 if the lines do not contain the claimed code.
+   Discard with D2 if no concrete failure scenario can be written.
+3. **Trace reachability.** Name the production entry point that reaches the code:
+   route, worker, scheduled job, or CLI command. Discard with D3 if no entry
+   point reaches the failure path.
+4. **Search for guards.** Check validation in callers, DB constraints in
+   migrations, unique indexes, locks, `ON CONFLICT` clauses, transaction scope,
+   and tests that already cover the scenario. Discard with D4 if a guard prevents
+   the failure.
+5. **Check intent.** Read the spec, reference doc, or decision record for the
+   behavior. Discard with D5 if the docs state that the behavior is intended. If
+   the docs and the code disagree, convert the candidate to an Intent Question.
+6. **Check standing rulings.** Compare the candidate with the project instructions
+   and memory feedback. Discard with D6 if a ruling excludes the candidate, and
+   cite the ruling.
+7. **Separate introduced from pre-existing.** Compare with
+   `git show BASE_REF:<path>`. Discard with D7 a defect that exists identically
+   at base and that the PR does not extend. Keep it as a PENDING candidate only
+   if it is material and the pending register does not already track it.
+8. **Settle cheap checks.** Run a read-only query or a targeted test when either
+   settles the claim. Run tests only when `REVIEW_ROOT` is the user's checkout,
+   and only with the project's documented test command. Never state production
+   user behavior from local data when the project forbids that inference.
+
+Assign one verdict:
+
+- **CONFIRMED** — steps 2 to 7 pass, and the failure scenario traces end to end.
+- **PLAUSIBLE** — the code confirms the mechanism, but one trigger condition is
+  unverified. Write that condition as a testable check. Keep a PLAUSIBLE finding
+  only at severity critical or warning. Discard a PLAUSIBLE note with D8.
+- **DISCARDED** — any discard code applies.
+
+| Code | Discard reason |
+|---|---|
+| D1 | The cited lines do not show the claimed code. |
+| D2 | No concrete failure scenario exists. |
+| D3 | No production entry point reaches the failure path. |
+| D4 | An existing guard prevents the failure. |
+| D5 | The docs state that the behavior is intended. |
+| D6 | A standing project ruling excludes the finding. |
+| D7 | The defect is pre-existing, and the PR does not extend it. |
+| D8 | The finding is a note-level concern with an unverified trigger. |
+| D9 | The finding is a style or lint issue that the project's linter owns. |
+| D10 | The finding is a quota finding with no defect behind it. |
+
+Re-rate the severity of every kept finding from its impact:
+
+- **critical**: data loss, a wrong balance or ledger entry, a security breach, a
+  production outage, or unapproved removal of live behavior.
+- **warning**: wrong behavior in a reachable edge case, a missing required test
+  or doc, a net-new boundary violation, or a parallel implementation.
+- **note**: a maintainability issue with no behavior impact.
+
+## Phase 6 — Assign a disposition
+
+| Disposition | Use when |
+|---|---|
+| **FIX** | A critical or warning finding that the PR introduces. A test or doc that the project requires in the same change. A net-new boundary violation. A parallel implementation. Fix before merge. |
+| **PENDING** | The finding is real and material, but its fix carries its own risk, needs a lead-developer decision, or is outside the PR's scope. Pre-existing debt the review surfaced belongs here. |
+| **IGNORE** | The finding is confirmed but immaterial: the cost of the change exceeds the risk. |
+| **QUESTION** | The finding depends on intent that the code and docs cannot settle. |
+
+Apply these rules:
+
+- A defect that this PR introduces is FIX. Scope is not a reason to defer it.
+- A doc or test that the project requires in the same change is FIX. It is never
+  PENDING.
+- Every IGNORE names the evidence that makes the finding immaterial.
+- Never change a FIX to PENDING to make the PR look finished.
+- Find the pending register through the project instructions, memory, or a Glob
+  for `**/pending_items*.md`. Draft each PENDING entry in the register's tier
+  structure, numbering, and entry style. Separate confirmed facts from unverified
+  conditions. Include "Raised on the PR #<N> review (<YYYY-MM-DD>)". Do not write
+  the entry until the user approves it.
+
+## Phase 7 — Write the report
+
+Rate each dimension:
+
+- **Strong**: no kept finding, and positive evidence exists, such as a
+  production-entry test.
+- **Adequate**: only IGNORE or note-level findings.
+- **Weak**: at least one FIX warning, or at least one PENDING finding.
+- **Failing**: at least one FIX critical.
+
+Rate the PR overall:
+
+- **Not mergeable**: at least one FIX critical, or a removed production call with
+  status "none found" or "unclear".
+- **Needs changes**: at least one FIX.
+- **Mergeable with tracked follow-ups**: no FIX, and at least one PENDING.
+- **Strong**: no FIX, and no PENDING.
+
+Report template:
+
+````markdown
+## PR Review: <title> (#<N>)
+
+**Overall: <rating>.** <One sentence: the deciding reason.>
+Head `<short HEAD_SHA>` against `<BASE_REF>`. <files> files, +<added> / -<removed>.
+Reviewers: /code-review high (<subagent | inline | not run>), /adversarial-reviewer (<ran | not run>), standards pass (ran).
+Candidates: <raised> raised, <kept> kept, <discarded> discarded.
+
+### Shape
+- **Purpose:** ...
+- **Layers:** ...
+- **Blast radius:** <rating>. <reason>
+- **Contract surfaces:** ...
+- **Tests / docs touched:** ...
+- **Orchestration flag:** <set | not set>
+
+### Strength assessment
+| Dimension | Rating | Evidence |
+|---|---|---|
+| Correctness | | |
+| Boundaries and reuse | | |
+| Tests | | |
+| Docs | | |
+| Change safety | | |
+| Scope and shape | | |
+
+### Findings
+#### F1 · FIX · critical — <claim>
+- **Location:** `path:line`
+- **Code:** <quoted lines>
+- **Failure scenario:** ...
+- **Validation:** <verdict>. Entry point: ... Guards checked: ... Base comparison: introduced.
+- **Sources:** CR-2, ADV-1
+- **Recommendation:** <the fix, in one to three sentences>
+
+<Order the findings: FIX critical, FIX warning, PENDING, QUESTION, IGNORE.>
+
+### Required review sections
+<Include only when the orchestration flag is set and the project defines a
+review format. Include every required heading, even when it is empty. Refer to
+findings by F-number. Do not repeat their text.>
+
+### Intent Questions
+
+### Draft pending entries
+<One block per PENDING finding. Not written to the register.>
+
+### Standards applied
+| ID | Rule | Source | Result |
+|---|---|---|---|
+
+### Discarded candidates
+| Candidate | Claim | Code | Reason |
+|---|---|---|---|
+
+### Not verified
+<Each check that the review did not run, and why.>
+
+Worktree: `<REVIEW_ROOT>` (kept for follow-up questions).
+````
+
+## Answering follow-up questions
+
+When the user questions a finding after the report:
+
+1. Re-open the recorded evidence and the code at `HEAD_SHA` before answering.
+2. Identify what the question adds: new evidence, a missed guard, a ruling, or a
+   different reading of intent.
+3. Change a verdict or disposition only when new evidence contradicts the
+   recorded evidence. Cite that evidence as `file:line` or as a doc line.
+4. When the review missed something, name the validation step that missed it.
+5. When the evidence still supports a finding, keep the finding. State what
+   evidence would change it.
+6. Record each change on one line:
+   `Revised F3: FIX -> IGNORE. Evidence: <file:line>. Missed at: step 4.`
+
+A question is not evidence. Pushback alone never changes a verdict. New evidence
+always does.
+
+## Cleanup
+
+Keep the worktree while follow-up questions continue. When the user closes the
+review or starts a different task, run:
+
 ```bash
-# Find all files importing a changed module
-grep -r "from ['\"].*changed-module['\"]" src/ --include="*.ts" -l
-grep -r "require(['\"].*changed-module" src/ --include="*.js" -l
-
-# Python
-grep -r "from changed_module import\|import changed_module" . --include="*.py" -l
+git worktree remove --force <REVIEW_ROOT>
+git worktree prune
 ```
 
-2. **Service boundaries** — does this change cross a service?
-```bash
-# Check if changed files span multiple services (monorepo)
-gh pr diff $PR --name-only | cut -d/ -f1-2 | sort -u
-```
-
-3. **Shared contracts** — types, interfaces, schemas
-```bash
-gh pr diff $PR --name-only | grep -E "types/|interfaces/|schemas/|models/"
-```
-
-**Blast radius severity:**
-- CRITICAL — shared library, DB model, auth middleware, API contract
-- HIGH     — service used by >3 others, shared config, env vars
-- MEDIUM   — single service internal change, utility function
-- LOW      — UI component, test file, docs
-
-### Step 3 — Security Scan
-
-```bash
-DIFF=/tmp/pr-$PR.diff
-
-# SQL Injection — raw query string interpolation
-grep -n "query\|execute\|raw(" $DIFF | grep -E '\$\{|f"|%s|format\('
-
-# Hardcoded secrets
-grep -nE "(password|secret|api_key|token|private_key)\s*=\s*['\"][^'\"]{8,}" $DIFF
-
-# AWS key pattern
-grep -nE "AKIA[0-9A-Z]{16}" $DIFF
-
-# JWT secret in code
-grep -nE "jwt\.sign\(.*['\"][^'\"]{20,}['\"]" $DIFF
-
-# XSS vectors
-grep -n "dangerouslySetInnerHTML\|innerHTML\s*=" $DIFF
-
-# Auth bypass patterns
-grep -n "bypass\|skip.*auth\|noauth\|TODO.*auth" $DIFF
-
-# Insecure hash algorithms
-grep -nE "md5\(|sha1\(|createHash\(['\"]md5|createHash\(['\"]sha1" $DIFF
-
-# eval / exec
-grep -nE "\beval\(|\bexec\(|\bsubprocess\.call\(" $DIFF
-
-# Prototype pollution
-grep -n "__proto__\|constructor\[" $DIFF
-
-# Path traversal risk
-grep -nE "path\.join\(.*req\.|readFile\(.*req\." $DIFF
-```
-
-### Step 4 — Test Coverage Delta
-
-```bash
-# Count source vs test files changed
-CHANGED_SRC=$(gh pr diff $PR --name-only | grep -vE "\.test\.|\.spec\.|__tests__")
-CHANGED_TESTS=$(gh pr diff $PR --name-only | grep -E "\.test\.|\.spec\.|__tests__")
-
-echo "Source files changed: $(echo "$CHANGED_SRC" | wc -w)"
-echo "Test files changed:   $(echo "$CHANGED_TESTS" | wc -w)"
-
-# Lines of new logic vs new test lines
-LOGIC_LINES=$(grep "^+" /tmp/pr-$PR.diff | grep -v "^+++" | wc -l)
-echo "New lines added: $LOGIC_LINES"
-
-# Run coverage locally
-npm test -- --coverage --changedSince=main 2>/dev/null | tail -20
-pytest --cov --cov-report=term-missing 2>/dev/null | tail -20
-```
-
-**Coverage delta rules:**
-- New function without tests → flag
-- Deleted tests without deleted code → flag
-- Coverage drop >5% → block merge
-- Auth/payments paths → require 100% coverage
-
-### Step 5 — Breaking Change Detection
-
-#### API Contract Changes
-```bash
-# OpenAPI/Swagger spec changes
-grep -n "openapi\|swagger" /tmp/pr-$PR.diff | head -20
-
-# REST route removals or renames
-grep "^-" /tmp/pr-$PR.diff | grep -E "router\.(get|post|put|delete|patch)\("
-
-# GraphQL schema removals
-grep "^-" /tmp/pr-$PR.diff | grep -E "^-\s*(type |field |Query |Mutation )"
-
-# TypeScript interface removals
-grep "^-" /tmp/pr-$PR.diff | grep -E "^-\s*(export\s+)?(interface|type) "
-```
-
-#### DB Schema Changes
-```bash
-# Migration files added
-gh pr diff $PR --name-only | grep -E "migrations?/|alembic/|knex/"
-
-# Destructive operations
-grep -E "DROP TABLE|DROP COLUMN|ALTER.*NOT NULL|TRUNCATE" /tmp/pr-$PR.diff
-
-# Index removals (perf regression risk)
-grep "DROP INDEX\|remove_index" /tmp/pr-$PR.diff
-```
-
-#### Config / Env Var Changes
-```bash
-# New env vars referenced in code (might be missing in prod)
-grep "^+" /tmp/pr-$PR.diff | grep -oE "process\.env\.[A-Z_]+" | sort -u
-
-# Removed env vars (could break running instances)
-grep "^-" /tmp/pr-$PR.diff | grep -oE "process\.env\.[A-Z_]+" | sort -u
-```
-
-### Step 6 — Performance Impact
-
-```bash
-# N+1 query patterns (DB calls inside loops)
-grep -n "\.find\|\.findOne\|\.query\|db\." /tmp/pr-$PR.diff | grep "^+" | head -20
-# Then check surrounding context for forEach/map/for loops
-
-# Heavy new dependencies
-grep "^+" /tmp/pr-$PR.diff | grep -E '"[a-z@].*":\s*"[0-9^~]' | head -20
-
-# Unbounded loops
-grep -n "while (true\|while(true" /tmp/pr-$PR.diff | grep "^+"
-
-# Missing await (accidentally sequential promises)
-grep -n "await.*await" /tmp/pr-$PR.diff | grep "^+" | head -10
-
-# Large in-memory allocations
-grep -n "new Array([0-9]\{4,\}\|Buffer\.alloc" /tmp/pr-$PR.diff | grep "^+"
-```
-
----
-
-## Ticket Linking Verification
-
-```bash
-# Extract ticket references from PR body
-gh pr view $PR --json body | jq -r '.body' | \
-  grep -oE "(PROJ-[0-9]+|[A-Z]+-[0-9]+|https://linear\.app/[^)\"]+)" | sort -u
-
-# Verify Jira ticket exists (requires JIRA_API_TOKEN)
-TICKET="PROJ-123"
-curl -s -u "user@company.com:$JIRA_API_TOKEN" \
-  "https://your-org.atlassian.net/rest/api/3/issue/$TICKET" | \
-  jq '{key, summary: .fields.summary, status: .fields.status.name}'
-
-# Linear ticket
-LINEAR_ID="abc-123"
-curl -s -H "Authorization: $LINEAR_API_KEY" \
-  -H "Content-Type: application/json" \
-  --data "{\"query\": \"{ issue(id: \\\"$LINEAR_ID\\\") { title state { name } } }\"}" \
-  https://api.linear.app/graphql | jq .
-```
-
----
-
-## Complete Review Checklist (30+ Items)
-
-```markdown
-## Code Review Checklist
-
-### Scope & Context
-- [ ] PR title accurately describes the change
-- [ ] PR description explains WHY, not just WHAT
-- [ ] Linked Jira/Linear ticket exists and matches scope
-- [ ] No unrelated changes (scope creep)
-- [ ] Breaking changes documented in PR body
-
-### Blast Radius
-- [ ] Identified all files importing changed modules
-- [ ] Cross-service dependencies checked
-- [ ] Shared types/interfaces/schemas reviewed for breakage
-- [ ] New env vars documented in .env.example
-- [ ] DB migrations are reversible (have down() / rollback)
-
-### Security
-- [ ] No hardcoded secrets or API keys
-- [ ] SQL queries use parameterized inputs (no string interpolation)
-- [ ] User inputs validated/sanitized before use
-- [ ] Auth/authorization checks on all new endpoints
-- [ ] No XSS vectors (innerHTML, dangerouslySetInnerHTML)
-- [ ] New dependencies checked for known CVEs
-- [ ] No sensitive data in logs (PII, tokens, passwords)
-- [ ] File uploads validated (type, size, content-type)
-- [ ] CORS configured correctly for new endpoints
-
-### Testing
-- [ ] New public functions have unit tests
-- [ ] Edge cases covered (empty, null, max values)
-- [ ] Error paths tested (not just happy path)
-- [ ] Integration tests for API endpoint changes
-- [ ] No tests deleted without clear reason
-- [ ] Test names clearly describe what they verify
-
-### Breaking Changes
-- [ ] No API endpoints removed without deprecation notice
-- [ ] No required fields added to existing API responses
-- [ ] No DB columns removed without two-phase migration plan
-- [ ] No env vars removed that may be set in production
-- [ ] Backward-compatible for external API consumers
-
-### Performance
-- [ ] No N+1 query patterns introduced
-- [ ] DB indexes added for new query patterns
-- [ ] No unbounded loops on potentially large datasets
-- [ ] No heavy new dependencies without justification
-- [ ] Async operations correctly awaited
-- [ ] Caching considered for expensive repeated operations
-
-### Code Quality
-- [ ] No dead code or unused imports
-- [ ] Error handling present (no bare empty catch blocks)
-- [ ] Consistent with existing patterns and conventions
-- [ ] Complex logic has explanatory comments
-- [ ] No unresolved TODOs (or tracked in ticket)
-```
-
----
-
-## Output Format
-
-Structure your review comment as:
-
-```
-## PR Review: [PR Title] (#NUMBER)
-
-Blast Radius: HIGH — changes lib/auth used by 5 services
-Security: 1 finding (medium severity)
-Tests: Coverage delta +2%
-Breaking Changes: None detected
-
---- MUST FIX (Blocking) ---
-
-1. SQL Injection risk in src/db/users.ts:42
-   Raw string interpolation in WHERE clause.
-   Fix: db.query("SELECT * WHERE id = $1", [userId])
-
---- SHOULD FIX (Non-blocking) ---
-
-2. Missing auth check on POST /api/admin/reset
-   No role verification before destructive operation.
-
---- SUGGESTIONS ---
-
-3. N+1 pattern in src/services/reports.ts:88
-   findUser() called inside results.map() — batch with findManyUsers(ids)
-
---- LOOKS GOOD ---
-- Test coverage for new auth flow is thorough
-- DB migration has proper down() rollback method
-- Error handling consistent with rest of codebase
-```
-
----
-
-## Common Pitfalls
-
-- **Reviewing style over substance** — let the linter handle style; focus on logic, security, correctness
-- **Missing blast radius** — a 5-line change in a shared utility can break 20 services
-- **Approving untested happy paths** — always verify error paths have coverage
-- **Ignoring migration risk** — NOT NULL additions need a default or two-phase migration
-- **Indirect secret exposure** — secrets in error messages/logs, not just hardcoded values
-- **Skipping large PRs** — if a PR is too large to review properly, request it be split
-
----
-
-## Best Practices
-
-1. Read the linked ticket before looking at code — context prevents false positives
-2. Check CI status before reviewing — don't review code that fails to build
-3. Prioritize blast radius and security over style
-4. Reproduce locally for non-trivial auth or performance changes
-5. Label each comment clearly: "nit:", "must:", "question:", "suggestion:"
-6. Batch all comments in one review round — don't trickle feedback
-7. Acknowledge good patterns, not just problems — specific praise improves culture
+Never remove `REVIEW_ROOT` when it is the user's checkout.

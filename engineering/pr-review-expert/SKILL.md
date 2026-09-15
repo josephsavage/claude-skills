@@ -83,6 +83,7 @@ Record these values and use them in every later phase:
 | `DIFF_RANGE` | `BASE_REF...HEAD_SHA` (diff from the merge base) |
 | `REVIEW_ROOT` | absolute path of the worktree, or of the user's checkout |
 | `DIFF_FILE` | absolute path of the saved diff |
+| `PR_STATE` | `open` or `merged`, from the `state` field. Phases 6 and 7 use it. |
 
 ## Phase 1 — Map the shape
 
@@ -310,7 +311,7 @@ Re-rate the severity of every kept finding from its impact:
 
 | Disposition | Use when |
 |---|---|
-| **FIX** | A critical or warning finding that the PR introduces. A test or doc that the project requires in the same change. A net-new boundary violation. A parallel implementation. Fix before merge. |
+| **FIX** | A critical or warning finding that the PR introduces. A test or doc that the project requires in the same change. A net-new boundary violation. A parallel implementation. Fix before merge, or on a follow-up branch when `PR_STATE` is `merged`. |
 | **PENDING** | The finding is real and material, but its fix carries its own risk, needs a lead-developer decision, or is outside the PR's scope. Pre-existing debt the review surfaced belongs here. |
 | **IGNORE** | The finding is confirmed but immaterial: the cost of the change exceeds the risk. |
 | **QUESTION** | The finding depends on intent that the code and docs cannot settle. |
@@ -322,6 +323,10 @@ Apply these rules:
   PENDING.
 - Every IGNORE names the evidence that makes the finding immaterial.
 - Never change a FIX to PENDING to make the PR look finished.
+- **Merged PRs.** When `PR_STATE` is `merged`, a FIX means a change on a
+  follow-up branch from the base branch, before the next release. The merge
+  does not lower a FIX to PENDING. The defect is live, so the fix is more urgent,
+  not less.
 - Find the pending register through the project instructions, memory, or a Glob
   for `**/pending_items*.md`. Draft each PENDING entry in the register's tier
   structure, numbering, and entry style. Separate confirmed facts from unverified
@@ -330,28 +335,50 @@ Apply these rules:
 
 ## Phase 7 — Write the report
 
-Rate each dimension:
+Assign every kept finding to exactly one dimension:
 
-- **Strong**: no kept finding, and positive evidence exists, such as a
-  production-entry test.
-- **Adequate**: only IGNORE or note-level findings.
-- **Weak**: at least one FIX warning, or at least one PENDING finding.
+| Dimension | Scope |
+|---|---|
+| Correctness | Product behavior: code that a production entry point reaches (routes, workers, scheduled jobs, domain, migrations). |
+| Boundaries and reuse | Layer boundaries and duplicated implementations (standards S1, S2). |
+| Tests | Test presence and test quality for product code (S3). |
+| Docs | Reference docs, specs, and briefs (S4). |
+| Change safety | Deprecation, contract changes, migrations, preservation maps (S5, S6). |
+| Scope and shape | PR size, bundled unrelated changes, split recommendations. |
+| Tooling | Developer tooling that no production entry point reaches: hooks, scripts, CI configuration, local dev config, and the tests of that tooling. |
+
+A tooling defect counts toward Tooling, never toward Correctness or Tests.
+
+Rate each dimension with the first rule that matches:
+
+- **N/A**: the diff does not touch the dimension's scope.
 - **Failing**: at least one FIX critical.
+- **Weak**: at least one FIX warning, or at least one PENDING finding.
+- **Adequate**: only IGNORE, QUESTION, or note-level findings; or no kept
+  finding and no positive evidence.
+- **Strong**: no kept finding, and positive evidence exists, such as a
+  production-entry test. Name the evidence.
 
-Rate the PR overall:
+Rate the PR overall with the first rule that matches. Use the label for
+`PR_STATE`:
 
-- **Not mergeable**: at least one FIX critical, or a removed production call with
-  status "none found" or "unclear".
-- **Needs changes**: at least one FIX.
-- **Mergeable with tracked follow-ups**: no FIX, and at least one PENDING.
-- **Strong**: no FIX, and no PENDING.
+| Rule | Open PR | Merged PR |
+|---|---|---|
+| At least one FIX critical, or a removed production call with status "none found" or "unclear" | **Not mergeable** | **Urgent follow-up** |
+| At least one FIX | **Needs changes** | **Needs follow-up changes** |
+| No FIX, and at least one PENDING | **Mergeable with tracked follow-ups** | **Sound, with tracked follow-ups** |
+| No FIX, and no PENDING | **Strong** | **Strong** |
+
+In the overall sentence, state how many FIX findings are product findings and
+how many are Tooling findings.
 
 Report template:
 
 ````markdown
 ## PR Review: <title> (#<N>)
 
-**Overall: <rating>.** <One sentence: the deciding reason.>
+**Overall: <rating>.** <One sentence: the deciding reason, with the product / Tooling FIX counts.>
+PR state: <open | merged — each FIX is follow-up-branch work>.
 Head `<short HEAD_SHA>` against `<BASE_REF>`. <files> files, +<added> / -<removed>.
 Reviewers: /code-review high (<subagent | inline | not run>), /adversarial-reviewer (<ran | not run>), standards pass (ran).
 Candidates: <raised> raised, <kept> kept, <discarded> discarded.
@@ -373,6 +400,7 @@ Candidates: <raised> raised, <kept> kept, <discarded> discarded.
 | Docs | | |
 | Change safety | | |
 | Scope and shape | | |
+| Tooling | | |
 
 ### Findings
 #### F1 · FIX · critical — <claim>

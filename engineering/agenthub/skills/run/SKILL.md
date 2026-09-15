@@ -70,6 +70,10 @@ If `--template` was provided, use the template dispatch prompt from `references/
 
 Launch all agents in a single message with multiple Agent tool calls (true parallelism).
 
+Set `model` explicitly on every Agent call — see "Before Spawning: Requirements First, Then
+Model Selection" in `skills/spawn/SKILL.md`. Default to `sonnet`; never let subagents silently
+inherit the orchestrator's model, which multiplies the most expensive model N times.
+
 ### Step 4: Wait and Monitor
 
 After spawning, inform the user that agents are running. When all agents complete (Agent tool returns results):
@@ -105,6 +109,7 @@ If confirmed, run `/hub:merge`. If declined, inform the user they can:
 ## Critical Rules
 
 - **Sequential execution** — each step depends on the previous
+- **Explicit `model` on every spawned agent** — lowest capable model, default `sonnet`
 - **Stop on failure** — if any step fails, report the error and stop
 - **User confirms merge** — never auto-merge without asking
 - **Template is optional** — without `--template`, agents use the default dispatch prompt from `/hub:spawn`

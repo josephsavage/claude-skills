@@ -107,6 +107,12 @@ python scripts/api_load_tester.py https://api.example.com/v1/users https://api.e
 
 ## Backend Development Workflows
 
+### Architecture Boundaries
+
+- Routers only parse/authenticate, call domain functions, commit, and format responses.
+- Workers only dequeue, call domain functions, commit, and ACK/NACK.
+- Domain functions own business rules, DB writes, validation policy, and domain exceptions.
+
 ### API Design Workflow
 
 Use when designing a new API or refactoring existing endpoints.

@@ -30,6 +30,37 @@ When `--template <name>` is provided, use the dispatch prompt from `references/a
 
 When using a template, replace all `{variables}` with values from the session config. Assign each agent a **different strategy** appropriate to the template and task — diverse strategies maximize the value of parallel exploration.
 
+## Before Spawning: Requirements First, Then Model Selection
+
+**The orchestrator thinks once; agents execute.** Parallel agents multiply every token
+the orchestrator failed to provide up front — N agents each re-researching the same API
+or re-deriving the same requirements is the fastest way to burn through session limits.
+
+**1. Front-load complete requirements into each dispatch post:**
+- Exact task plus acceptance criteria — what "done" means and what the judge will reward
+- Pre-researched facts (API endpoints, SDK/package names, known gotchas, domain rules
+  like sign conventions or formulas) — researched ONCE by the orchestrator, stated as
+  facts the agents can trust without re-verification
+- Hard constraints: schemas, env var names, invariants that must not change
+- The agent's assigned strategy and how it differs from the other agents
+- Absolute paths for anything outside the worktree (the dispatch/results board, any
+  gitignored docs — worktrees only materialize committed files)
+
+If requirements are ambiguous, resolve them with the user BEFORE spawning — a wrong
+assumption baked into N dispatch posts is N times as expensive to fix.
+
+**2. Pick the lowest capable model for each agent** and pass it via the Agent tool's
+`model` parameter. Subagents inherit the orchestrator's model by default, which is
+usually the most expensive option:
+
+| Model | Use for |
+|-------|---------|
+| `haiku` | Mechanical work: applying a spelled-out recipe, renames, config changes, test scaffolding |
+| `sonnet` | **Default.** Standard implementation: migrations, refactors, feature code with clear requirements |
+| inherit / `opus` | Only when the task genuinely needs deep reasoning (novel architecture, subtle concurrency) — and prefer ONE strong agent over N |
+
+The better the dispatch post, the cheaper the model that can execute it.
+
 ## What It Does
 
 1. Load session config from `.agenthub/sessions/{session-id}/config.yaml`
@@ -58,7 +89,8 @@ Constraints:
 - Do NOT access .agenthub/board/results/ for other agents
 - Commit early and often with descriptive messages
 - If you hit a dead end, commit what you have and explain in your result",
-  isolation: "worktree"
+  isolation: "worktree",
+  model: "sonnet"  // lowest capable model — see "Before Spawning" above
 )
 ```
 
@@ -71,6 +103,8 @@ python {skill_path}/scripts/session_manager.py --update {session-id} --state run
 
 - **All agents in ONE message** — spawn all Agent tool calls simultaneously for true parallelism
 - **isolation: "worktree"** is mandatory — each agent needs its own filesystem
+- **Set `model` explicitly on every Agent call** — lowest capable model for the dispatch (default `sonnet`); never silently inherit the orchestrator's model
+- **Requirements are settled before spawn** — dispatch posts carry acceptance criteria and pre-researched facts; agents should never have to re-research what the orchestrator already knows
 - **Never modify session config** after spawn — agents rely on stable configuration
 - **Each agent gets a unique board post** — dispatch posts are numbered sequentially
 

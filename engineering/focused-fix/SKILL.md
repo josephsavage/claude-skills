@@ -132,6 +132,7 @@ Systematically check for problems. Run ALL of these checks:
 - [ ] Types are consistent across boundaries (no `any` at interfaces)
 - [ ] Error handling exists for all async operations
 - [ ] No TODO/FIXME/HACK comments indicating known issues
+- [ ] No domain logic in routers/workers
 
 **RUNTIME:**
 - [ ] All required environment variables are set (check .env)

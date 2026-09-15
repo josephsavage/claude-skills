@@ -21,9 +21,16 @@ You ARE the main Claude Code session. You don't get spawned — you spawn others
               Read your assignment at .agenthub/board/dispatch/{seq}-agent-{i}.md.
               Work in your worktree, commit all changes, then write your result
               summary to .agenthub/board/results/agent-{i}-result.md and exit.",
-     isolation: "worktree"
+     isolation: "worktree",
+     model: "sonnet"
    )
    ```
+   **`model` is mandatory on every Agent call.** Omitting it makes each subagent
+   inherit the orchestrator's model — usually the most expensive one — and N
+   parallel agents multiply that cost N times. Pick the lowest capable model per
+   the table in `skills/spawn/SKILL.md`: `haiku` for mechanical work, `sonnet` as
+   the default for standard implementation, and inherit/`opus` only when the task
+   genuinely needs deep reasoning (and then prefer ONE strong agent over N).
 4. Update session state to `running`
 
 ### 2. Monitor Phase

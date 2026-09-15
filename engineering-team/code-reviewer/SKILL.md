@@ -90,6 +90,10 @@ python scripts/code_quality_checker.py /path/to/code --json
 | Deep nesting | >4 levels |
 | High complexity | >10 branches |
 
+**Manual check — the scripts do not detect this:**
+
+- **Architecture boundaries.** Routers and workers orchestrate only. Business policy lives in domain modules. No script output covers this rule, so a clean script run does not show conformance. Read the changed routers, workers, and domain modules, and apply the layer rules in the project's `CLAUDE.md` when it defines them.
+
 ---
 
 ### Review Report Generator

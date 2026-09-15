@@ -51,13 +51,16 @@ Quota finding: yes | no
 For a PR number `<N>`:
 
 ```bash
-gh pr view <N> --json number,title,body,url,baseRefName,headRefName,headRefOid,additions,deletions,changedFiles,commits,labels
+gh pr view <N> --json number,title,body,url,state,baseRefName,baseRefOid,headRefName,headRefOid,additions,deletions,changedFiles,commits,labels
 git fetch origin <baseRefName>
 git fetch origin pull/<N>/head
 git rev-parse FETCH_HEAD        # must equal headRefOid; stop and report a mismatch
 git worktree add --detach <scratchpad>/pr-<N> <headRefOid>
-git -C <scratchpad>/pr-<N> diff origin/<baseRefName>...<headRefOid> > <scratchpad>/pr-<N>.diff
+git -C <scratchpad>/pr-<N> diff <BASE_REF>...<headRefOid> > <scratchpad>/pr-<N>.diff
 ```
+
+Set `BASE_REF` from the table below before writing the diff. Stop and report if
+the diff is empty.
 
 For a branch name, or no argument, run `gh pr view [<branch>] --json ...` to find
 the open PR. If no PR exists, use the PR base branch that the project
@@ -75,7 +78,7 @@ Record these values and use them in every later phase:
 | Value | Meaning |
 |---|---|
 | `TARGET` | PR number, or branch name |
-| `BASE_REF` | `origin/<baseRefName>` |
+| `BASE_REF` | `origin/<baseRefName>` for an open PR. `baseRefOid` for a merged PR, because the base branch already contains a merge-committed head and the merge-base diff is then empty. |
 | `HEAD_SHA` | `headRefOid` |
 | `DIFF_RANGE` | `BASE_REF...HEAD_SHA` (diff from the merge base) |
 | `REVIEW_ROOT` | absolute path of the worktree, or of the user's checkout |

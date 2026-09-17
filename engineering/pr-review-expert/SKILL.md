@@ -1,14 +1,18 @@
 ---
 name: "pr-review-expert"
-description: "Orchestrated pull request review. Maps the PR's shape, runs /code-review high and /adversarial-reviewer as subagents, checks the diff against the project's own standards, validates every finding against the code, discards weak findings, and reports a PR strength assessment with a fix / pending / ignore recommendation per finding. Use when the user asks to review a pull request, a branch, or a diff."
+description: "Orchestrated pull request review. Maps the PR's shape, runs /code-review high and /adversarial-reviewer as subagents, checks the diff against the project's own standards, executes the PR's tests, migrations, and deployment steps against production-state data, validates every finding against the code, discards weak findings, and reports a PR strength assessment with a fix / pending / ignore recommendation per finding. Use when the user asks to review a pull request, a branch, or a diff."
 argument-hint: "[PR number | branch name | empty for the current branch]"
 ---
 
 # PR Review Expert
 
 The session that loads this skill is the **orchestrator**. The orchestrator maps
-the PR, runs two reviewer subagents, runs its own project-standards pass, and
-validates every candidate finding. Only the orchestrator writes the report.
+the PR, runs two reviewer subagents, runs its own project-standards pass,
+executes the PR, and validates every candidate finding. Only the orchestrator
+writes the report.
+
+A review that only reads code accepts the author's test results, migration
+results, and deployment claims secondhand. This skill runs them.
 
 Target: `$ARGUMENTS`
 
@@ -19,23 +23,30 @@ Target: `$ARGUMENTS`
    scenario.
 2. **Docs before code.** Read the project instructions and the reference docs for
    touched modules before reading changed code.
-3. **Reviewer output is candidate input.** No subagent verdict is final. Phase 5
+3. **Reviewer output is candidate input.** No subagent verdict is final. Phase 6
    decides.
 4. **Severity comes from impact.** Agreement between reviewers raises confidence.
    Agreement does not raise severity.
-5. **Read-only.** Never check out the PR in the user's working tree. Never create
-   a local branch. Never push, approve, comment, or edit project files.
-6. **Never pass `--comment` or `--fix`** to `/code-review`.
-7. **No filler.** State a strength only when evidence supports it. Never add a
+5. **No outward writes.** Never push, approve, comment, merge, or edit the PR's
+   files. Never check out the PR in the user's working tree. Never create a local
+   branch. Never run a command that writes to a production host. Phase 4 writes
+   only to local containers and local databases, through the commands the project
+   documents.
+6. **Ask before a gated command.** When the project instructions require approval
+   for a command, such as a production data sync, ask once before running it. Name
+   what the command overwrites.
+7. **Never pass `--comment` or `--fix`** to `/code-review`.
+8. **No filler.** State a strength only when evidence supports it. Never add a
    finding to fill a section.
-8. **Stable verdicts.** After the report, follow "Answering follow-up questions".
+9. **Stable verdicts.** After the report, follow "Answering follow-up questions".
 
 ## Candidate finding format
 
-Every reviewer, and the standards pass, emits candidates in this format:
+Every reviewer, the standards pass, and the execution phase emit candidates in
+this format:
 
 ```
-ID: <CR-n | ADV-n | STD-n>
+ID: <CR-n | ADV-n | STD-n | EXE-n>
 Severity: critical | warning | note
 Location: path/to/file.py:123
 Claim: <one sentence>
@@ -83,7 +94,7 @@ Record these values and use them in every later phase:
 | `DIFF_RANGE` | `BASE_REF...HEAD_SHA` (diff from the merge base) |
 | `REVIEW_ROOT` | absolute path of the worktree, or of the user's checkout |
 | `DIFF_FILE` | absolute path of the saved diff |
-| `PR_STATE` | `open` or `merged`, from the `state` field. Phases 6 and 7 use it. |
+| `PR_STATE` | `open` or `merged`, from the `state` field. Phases 7 and 8 use it. |
 
 ## Phase 1 — Map the shape
 
@@ -117,6 +128,8 @@ and `DIFF_FILE`.
 9. **CI status.** Record `gh pr checks <N>` as information. Raise no finding for
    missing or failing CI when project instructions or memory mark CI as
    non-gating.
+10. **Execution scope.** Record whether the PR adds a migration, ships a release
+    note or runbook, or changes deployment steps. Phase 4 uses these facts.
 
 ## Phase 2 — Launch the adversarial reviewer (background)
 
@@ -139,6 +152,8 @@ different revision. Read every file from <REVIEW_ROOT>. Run git as
 2. Invoke the adversarial-reviewer skill with the Skill tool. Args: --diff <DIFF_RANGE>
 3. Run all three personas as that skill instructs.
 4. Do not edit files, commit, push, or post comments.
+5. Do not run containers, migrations, or tests. The orchestrator runs them
+   against a database it is changing, so a parallel run corrupts both results.
 
 Your final message is the only output the orchestrator receives. List every
 finding in the candidate format below, with ID prefix ADV-. Set
@@ -151,8 +166,9 @@ verdict.
 
 ## Phase 3 — Project standards pass (orchestrator)
 
-Run this pass while the adversarial reviewer works. Finish it before you read any
-reviewer output, so reviewer findings do not bias it.
+Run this pass while the adversarial reviewer works and while Phase 4's long steps
+run in the background. Finish it before you read any reviewer output, so
+reviewer findings do not bias it.
 
 ### 3a. Load the standards
 
@@ -178,6 +194,10 @@ every category below. For a category the project does not define, write
 | S4 | Documentation | When docs must ship, which doc tree holds which content, spec and brief updates. |
 | S5 | Change safety | Deprecation policy, preservation maps, TODO policy, required review format and headings. |
 | S6 | Data and schema | Migration workflow, idempotency, append-only tables, DDL location, DB constraints. |
+| S7 | Execution | The full test command, the migration command, the container lifecycle commands, the procedure that provisions production-state data and its approval rule, the parallel-stack procedure for a worktree, and where release runbooks live. |
+
+Read S7 first when Phase 1 set any execution scope, because Phase 4 needs it
+before the rest of this pass.
 
 ### 3b. Check the diff against the standards
 
@@ -210,7 +230,71 @@ changed functions.
 
 Write each result in the candidate format with ID prefix `STD-`.
 
-## Phase 4 — Run /code-review high (foreground)
+## Phase 4 — Execute the PR (orchestrator)
+
+Start this phase as soon as Phase 2 launches. Run every long step (a database
+restore, a test suite) in the background, and continue Phase 3 while it runs.
+Use the full commands that S7 records. Never substitute a shorthand the project
+marks unavailable.
+
+### 4a. Prepare the environment
+
+1. **Run the code at `HEAD_SHA`.** When the project's containers mount the user's
+   checkout and `REVIEW_ROOT` is a worktree, start a separate stack for the
+   worktree with the project's parallel-stack procedure. When the project
+   documents none, ask the user before you change what the containers mount.
+2. **Record the starting state:** the database's migration revision, the running
+   services, and the checked-out commit. Phase 4 restores none of them. The report
+   states what changed.
+3. **Provision production-state data** when the PR adds a migration or ships a
+   runbook: production's schema, data, and migration revision. Use the project's
+   documented procedure, and follow rule 6. A database built only from the
+   repository's migrations lacks every object production gained outside them, so
+   it cannot stand in for production.
+
+### 4b. Rehearse the deployment
+
+Run this step when the PR ships a release note or runbook, or changes deployment
+steps.
+
+1. Execute the documented steps in their documented order against the
+   production-state database. Apply only the substitutions the local environment
+   needs, such as a local compose overlay, and record each one.
+2. Run every pre-flight and post-release check the runbook lists. Compare each
+   result with the expected value the runbook states.
+3. Each failed step, each result that differs from its expected value, and each
+   step whose order exposes a code and schema mismatch is a candidate.
+
+When the PR adds a migration and ships no runbook, run the project's migration
+command from production's revision to the head at `HEAD_SHA`.
+
+### 4c. Round-trip the migration
+
+Run this step when the PR adds a migration. Upgrade to head, downgrade to
+production's revision, and upgrade again. Take a data fingerprint before and
+after each direction: row counts and aggregate sums for the tables the migration
+touches. A failed direction, or a fingerprint that changes, is a candidate.
+
+### 4d. Run the tests
+
+1. Run the full suite at `HEAD_SHA` against the migrated production-state
+   database.
+2. When a test fails, run it at `BASE_REF` against the same data at the base
+   revision. A test that fails at `HEAD_SHA` and passes at `BASE_REF` is a
+   candidate. A test that fails at both is pre-existing.
+3. When the PR description claims a mutation check, reproduce one.
+
+### 4e. Record the results
+
+Write each failure or mismatch as a candidate with ID prefix `EXE-`. Its evidence
+is the command, the output lines, and the expected value. A reproduced failure
+carries source verdict CONFIRMED.
+
+Record every step as ran, failed, or skipped. Give the reason for each skip, and
+the approval that would unblock it. The report's Execution section uses this
+record.
+
+## Phase 5 — Run /code-review high (foreground)
 
 Use the Agent tool with `subagent_type: general-purpose` and
 `run_in_background: false`. A foreground subagent keeps the Agent tool, so
@@ -228,7 +312,8 @@ different revision. When you read a file, read it from <REVIEW_ROOT>.
 1. Invoke the code-review skill with the Skill tool. Args: high <TARGET>
 2. Do not pass --comment or --fix. Do not edit files, commit, push, or post
    comments.
-3. If the Skill tool cannot load code-review, stop. Report
+3. Do not run containers, migrations, or tests. The orchestrator runs them.
+4. If the Skill tool cannot load code-review, stop. Report
    "code-review unavailable" with the error text.
 
 Your final message is the only output the orchestrator receives. The findings
@@ -244,12 +329,14 @@ format below, with ID prefix CR-. Keep the CONFIRMED or PLAUSIBLE verdict that
 `code-review` in the orchestrator with the Skill tool and args `high <TARGET>`.
 Record the run mode in the report.
 
-## Phase 5 — Validate every candidate
+## Phase 6 — Validate every candidate
 
-Wait for the completion notification of the adversarial reviewer. Do not poll.
-If a reviewer failed, record it as "not run" with its error, and continue.
+Wait for the completion notification of the adversarial reviewer and of every
+Phase 4 background step. Do not poll. If a reviewer failed, record it as
+"not run" with its error, and continue.
 
-Pool all `CR-`, `ADV-`, and `STD-` candidates. Apply these steps to each one:
+Pool all `CR-`, `ADV-`, `STD-`, and `EXE-` candidates. Apply these steps to each
+one:
 
 1. **Merge duplicates.** Merge candidates with one root cause into one finding.
    Keep every source ID.
@@ -257,8 +344,8 @@ Pool all `CR-`, `ADV-`, and `STD-` candidates. Apply these steps to each one:
    in the finding. Discard with D1 if the lines do not contain the claimed code.
    Discard with D2 if no concrete failure scenario can be written.
 3. **Trace reachability.** Name the production entry point that reaches the code:
-   route, worker, scheduled job, or CLI command. Discard with D3 if no entry
-   point reaches the failure path.
+   route, worker, scheduled job, CLI command, or deployment step. Discard with D3
+   if no entry point reaches the failure path.
 4. **Search for guards.** Check validation in callers, DB constraints in
    migrations, unique indexes, locks, `ON CONFLICT` clauses, transaction scope,
    and tests that already cover the scenario. Discard with D4 if a guard prevents
@@ -273,17 +360,19 @@ Pool all `CR-`, `ADV-`, and `STD-` candidates. Apply these steps to each one:
    `git show BASE_REF:<path>`. Discard with D7 a defect that exists identically
    at base and that the PR does not extend. Keep it as a PENDING candidate only
    if it is material and the pending register does not already track it.
-8. **Settle cheap checks.** Run a read-only query or a targeted test when either
-   settles the claim. Run tests only when `REVIEW_ROOT` is the user's checkout,
-   and only with the project's documented test command. Never state production
-   user behavior from local data when the project forbids that inference.
+8. **Settle the claim by execution.** Use the Phase 4 environment to run the
+   query, the targeted test, or the deployment step that decides the claim.
+   Record the command and its output as evidence. Discard with D11 when the
+   command ran and the failure did not occur. Never state production user
+   behavior from local data when the project forbids that inference.
 
 Assign one verdict:
 
-- **CONFIRMED** — steps 2 to 7 pass, and the failure scenario traces end to end.
+- **CONFIRMED** — steps 2 to 8 pass, and the failure scenario traces end to end.
 - **PLAUSIBLE** — the code confirms the mechanism, but one trigger condition is
-  unverified. Write that condition as a testable check. Keep a PLAUSIBLE finding
-  only at severity critical or warning. Discard a PLAUSIBLE note with D8.
+  unverified and no local execution can reach it. Write that condition as a
+  testable check. Keep a PLAUSIBLE finding only at severity critical or warning.
+  Discard a PLAUSIBLE note with D8.
 - **DISCARDED** — any discard code applies.
 
 | Code | Discard reason |
@@ -298,16 +387,18 @@ Assign one verdict:
 | D8 | The finding is a note-level concern with an unverified trigger. |
 | D9 | The finding is a style or lint issue that the project's linter owns. |
 | D10 | The finding is a quota finding with no defect behind it. |
+| D11 | Execution refutes the failure scenario: the command ran and the failure did not occur. |
 
 Re-rate the severity of every kept finding from its impact:
 
 - **critical**: data loss, a wrong balance or ledger entry, a security breach, a
-  production outage, or unapproved removal of live behavior.
+  production outage, a migration that fails on production-state data, or
+  unapproved removal of live behavior.
 - **warning**: wrong behavior in a reachable edge case, a missing required test
   or doc, a net-new boundary violation, or a parallel implementation.
 - **note**: a maintainability issue with no behavior impact.
 
-## Phase 6 — Assign a disposition
+## Phase 7 — Assign a disposition
 
 | Disposition | Use when |
 |---|---|
@@ -333,7 +424,7 @@ Apply these rules:
   conditions. Include "Raised on the PR #<N> review (<YYYY-MM-DD>)". Do not write
   the entry until the user approves it.
 
-## Phase 7 — Write the report
+## Phase 8 — Write the report
 
 Assign every kept finding to exactly one dimension:
 
@@ -343,7 +434,7 @@ Assign every kept finding to exactly one dimension:
 | Boundaries and reuse | Layer boundaries and duplicated implementations (standards S1, S2). |
 | Tests | Test presence and test quality for product code (S3). |
 | Docs | Reference docs, specs, and briefs (S4). |
-| Change safety | Deprecation, contract changes, migrations, preservation maps (S5, S6). |
+| Change safety | Deprecation, contract changes, migrations, deployment runbooks, preservation maps (S5, S6). |
 | Scope and shape | PR size, bundled unrelated changes, split recommendations. |
 | Tooling | Developer tooling that no production entry point reaches: hooks, scripts, CI configuration, local dev config, and the tests of that tooling. |
 
@@ -356,8 +447,9 @@ Rate each dimension with the first rule that matches:
 - **Weak**: at least one FIX warning, or at least one PENDING finding.
 - **Adequate**: only IGNORE, QUESTION, or note-level findings; or no kept
   finding and no positive evidence.
-- **Strong**: no kept finding, and positive evidence exists, such as a
-  production-entry test. Name the evidence.
+- **Strong**: no kept finding, and positive evidence exists. Name the evidence.
+  Correctness and Tests need a passing suite at `HEAD_SHA` from Phase 4. Change
+  safety needs a rehearsed migration or runbook from Phase 4 when the PR has one.
 
 Rate the PR overall with the first rule that matches. Use the label for
 `PR_STATE`:
@@ -368,6 +460,10 @@ Rate the PR overall with the first rule that matches. Use the label for
 | At least one FIX | **Needs changes** | **Needs follow-up changes** |
 | No FIX, and at least one PENDING | **Mergeable with tracked follow-ups** | **Sound, with tracked follow-ups** |
 | No FIX, and no PENDING | **Strong** | **Strong** |
+
+When Phase 4 skipped a step that the execution scope requires (the suite, a
+migration, a runbook rehearsal), append "unverified: <step>" to the overall
+rating.
 
 In the overall sentence, state how many FIX findings are product findings and
 how many are Tooling findings.
@@ -380,7 +476,7 @@ Report template:
 **Overall: <rating>.** <One sentence: the deciding reason, with the product / Tooling FIX counts.>
 PR state: <open | merged — each FIX is follow-up-branch work>.
 Head `<short HEAD_SHA>` against `<BASE_REF>`. <files> files, +<added> / -<removed>.
-Reviewers: /code-review high (<subagent | inline | not run>), /adversarial-reviewer (<ran | not run>), standards pass (ran).
+Reviewers: /code-review high (<subagent | inline | not run>), /adversarial-reviewer (<ran | not run>), standards pass (ran), execution (<ran | partial | not run>).
 Candidates: <raised> raised, <kept> kept, <discarded> discarded.
 
 ### Shape
@@ -390,6 +486,7 @@ Candidates: <raised> raised, <kept> kept, <discarded> discarded.
 - **Contract surfaces:** ...
 - **Tests / docs touched:** ...
 - **Orchestration flag:** <set | not set>
+- **Execution scope:** <migration | runbook | deployment steps | none>
 
 ### Strength assessment
 | Dimension | Rating | Evidence |
@@ -402,13 +499,23 @@ Candidates: <raised> raised, <kept> kept, <discarded> discarded.
 | Scope and shape | | |
 | Tooling | | |
 
+### Execution
+| Step | Command | Result | Evidence |
+|---|---|---|---|
+| Production-state data | | | |
+| Deployment rehearsal | | | |
+| Migration round trip | | | |
+| Test suite at HEAD_SHA | | | |
+
+Local state left: <database and its migration revision, stopped or started services, checked-out commit>.
+
 ### Findings
 #### F1 · FIX · critical — <claim>
 - **Location:** `path:line`
 - **Code:** <quoted lines>
 - **Failure scenario:** ...
-- **Validation:** <verdict>. Entry point: ... Guards checked: ... Base comparison: introduced.
-- **Sources:** CR-2, ADV-1
+- **Validation:** <verdict>. Entry point: ... Guards checked: ... Execution: ... Base comparison: introduced.
+- **Sources:** CR-2, ADV-1, EXE-1
 - **Recommendation:** <the fix, in one to three sentences>
 
 <Order the findings: FIX critical, FIX warning, PENDING, QUESTION, IGNORE.>
@@ -432,7 +539,7 @@ findings by F-number. Do not repeat their text.>
 |---|---|---|---|
 
 ### Not verified
-<Each check that the review did not run, and why.>
+<Each check that the review could not run, the reason, and the approval that would unblock it.>
 
 Worktree: `<REVIEW_ROOT>` (kept for follow-up questions).
 ````
@@ -444,12 +551,15 @@ When the user questions a finding after the report:
 1. Re-open the recorded evidence and the code at `HEAD_SHA` before answering.
 2. Identify what the question adds: new evidence, a missed guard, a ruling, or a
    different reading of intent.
-3. Change a verdict or disposition only when new evidence contradicts the
-   recorded evidence. Cite that evidence as `file:line` or as a doc line.
-4. When the review missed something, name the validation step that missed it.
-5. When the evidence still supports a finding, keep the finding. State what
+3. When a command in the Phase 4 environment can settle the question, run it
+   before answering.
+4. Change a verdict or disposition only when new evidence contradicts the
+   recorded evidence. Cite that evidence as `file:line`, a doc line, or command
+   output.
+5. When the review missed something, name the validation step that missed it.
+6. When the evidence still supports a finding, keep the finding. State what
    evidence would change it.
-6. Record each change on one line:
+7. Record each change on one line:
    `Revised F3: FIX -> IGNORE. Evidence: <file:line>. Missed at: step 4.`
 
 A question is not evidence. Pushback alone never changes a verdict. New evidence
@@ -457,12 +567,14 @@ always does.
 
 ## Cleanup
 
-Keep the worktree while follow-up questions continue. When the user closes the
-review or starts a different task, run:
+Keep the worktree, and any separate stack Phase 4 started, while follow-up
+questions continue. When the user closes the review or starts a different task,
+tear down that stack with the project's documented command, then run:
 
 ```bash
 git worktree remove --force <REVIEW_ROOT>
 git worktree prune
 ```
 
-Never remove `REVIEW_ROOT` when it is the user's checkout.
+Never remove `REVIEW_ROOT` when it is the user's checkout. Phase 4 does not
+restore the local database. Tell the user its final state before cleanup.
